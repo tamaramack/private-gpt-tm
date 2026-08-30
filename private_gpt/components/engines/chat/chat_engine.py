@@ -68,6 +68,7 @@ from private_gpt.components.engines.chat.utils.request_builder import (
     build_request_from_context_stack,
 )
 from private_gpt.components.engines.chat.utils.tool_utils import (
+    merge_stream_tool_calls,
     select_tool_names,
 )
 from private_gpt.components.llm.custom.base import StructuredOutputsParams, ZylonLLM
@@ -77,8 +78,7 @@ from private_gpt.components.llm.priorities import DefinedPriorities
 from private_gpt.components.tools.processors.base import _session_id
 from private_gpt.components.tools.remote_execution import (
     ToolExecutionInterceptor,
-    ToolExecutionRequest,
-    build_tool_execution_context,
+    build_tool_execution_request,
 )
 from private_gpt.components.tools.tool_scheduler import (
     BaseToolScheduler,
@@ -100,6 +100,7 @@ from private_gpt.events.models import (
     ThinkingBlock,
     ThinkingDelta,
     ToolResultBlock,
+    ToolUseBlock,
     Usage,
 )
 from private_gpt.server.chat.interceptors.schema_coercing_tool_interceptor import (
@@ -209,7 +210,7 @@ class ChatLoopEngine:
         llm_component: LLMComponent,
         request_interceptors: list[ChatRequestLoopInterceptor] | None = None,
         response_interceptors: list[ChatResponseLoopInterceptor] | None = None,
-        max_iterations: int = 40,
+        max_iterations: int | None = None,
         container_registry: ContainerRegistry | None = None,
         tool_scheduler: BaseToolScheduler | None = None,
         tool_interceptors: list[ToolExecutionInterceptor] | None = None,
@@ -293,9 +294,9 @@ class ChatLoopEngine:
             handler,
         )
 
-        while (
-            not run.stopped
-            and run.state.runtime.iteration < run.state.runtime.max_iterations
+        while not run.stopped and (
+            run.state.runtime.max_iterations is None
+            or run.state.runtime.iteration < run.state.runtime.max_iterations
         ):
             await self._run_intercepted_iteration(run, handler)
 
@@ -576,6 +577,7 @@ class ChatLoopEngine:
             assistant_message.content = chunk.message.content
 
         assistant_message.role = chunk.message.role or assistant_message.role
+        processed_tool_calls_id: int | None = None
         for source in (chunk.additional_kwargs, chunk.message.additional_kwargs):
             for key, value in source.items():
                 if key == "thinking_delta" and isinstance(value, str):
@@ -600,18 +602,15 @@ class ChatLoopEngine:
                     continue
                 if key == "tool_calls":
                     if isinstance(value, list) and value:
+                        value_id = id(value)
+                        if value_id == processed_tool_calls_id:
+                            continue
+                        processed_tool_calls_id = value_id
                         existing = assistant_message.additional_kwargs.get("tool_calls")
                         if not isinstance(existing, list):
                             existing = []
-                        by_id = {}
-                        for tc in existing:
-                            if tc.tool_id:
-                                by_id[tc.tool_id] = tc
-                        for tc in value:
-                            if tc.tool_id:
-                                by_id[tc.tool_id] = tc
-                        assistant_message.additional_kwargs["tool_calls"] = list(
-                            by_id.values()
+                        assistant_message.additional_kwargs["tool_calls"] = (
+                            merge_stream_tool_calls(existing, value)
                         )
                     continue
                 assistant_message.additional_kwargs[key] = value
@@ -663,18 +662,26 @@ class ChatLoopEngine:
 
                     async with lock:
                         unique_id = tool_state.tool_id_map[raw_id]
+                        tool_name = tool_call.tool_name or "unknown"
+                        tool_spec = tool_specs_by_name.get(tool_name)
+                        if tool_spec is None:
+                            content_block: ToolUseBlock = ToolUseBlock(
+                                id=unique_id,
+                                name=tool_name,
+                                input={},
+                            )
+                        else:
+                            content_block = (
+                                tool_spec.resolve_event_adapter().build_tool_use(
+                                    tool_id=unique_id,
+                                    tool_name=tool_name,
+                                    tool_input={},
+                                )
+                            )
                         use_start = RawContentBlockStartEvent(
                             index=run.block_count,
                             block_id=f"block_{uuid4().hex}",
-                            content_block=(
-                                tool_specs_by_name[tool_call.tool_name or ""]
-                                .resolve_event_adapter()
-                                .build_tool_use(
-                                    tool_id=unique_id,
-                                    tool_name=tool_call.tool_name or "",
-                                    tool_input={},
-                                )
-                            ),
+                            content_block=content_block,
                         )
                         run.block_count += 1
                         handler.emit(use_start)
@@ -1016,12 +1023,12 @@ class ChatLoopEngine:
 
         if self._tool_scheduler.is_async:
             handle = await self._tool_scheduler.async_execute(
-                ToolExecutionRequest(
+                build_tool_execution_request(
                     tool_id=call_id,
                     tool_name=tool_call.tool_name or "",
                     tool_kwargs=tool_call.tool_kwargs,
                     tool_spec=tool_spec,
-                    context=build_tool_execution_context(run.state),
+                    state=run.state,
                     hooks=ExecutionHooks(tool_result=run.hooks),
                 ),
                 state_ctx=run.state,
@@ -1039,12 +1046,12 @@ class ChatLoopEngine:
 
         async with semaphore if semaphore is not None else contextlib.nullcontext():
             response = await self._tool_scheduler.execute(
-                ToolExecutionRequest(
+                build_tool_execution_request(
                     tool_id=call_id,
                     tool_name=tool_call.tool_name or "",
                     tool_kwargs=tool_call.tool_kwargs,
                     tool_spec=tool_spec,
-                    context=build_tool_execution_context(run.state),
+                    state=run.state,
                     hooks=ExecutionHooks(tool_result=run.hooks),
                 ),
                 state_ctx=run.state,

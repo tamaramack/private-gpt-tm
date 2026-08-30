@@ -14,7 +14,7 @@ from private_gpt.components.chat.models.chat_config_models import (
     ResolvedToolConfig,
     ToolSpec,
 )
-from private_gpt.components.sandbox.content_bundle import ContentBundle
+from private_gpt.components.sandbox.mount import Mount
 from private_gpt.components.tools.builders.bash_tool_builder import BashToolBuilder
 from private_gpt.components.tools.builders.database_query_builder import (
     DatabaseQueryToolBuilder,
@@ -68,10 +68,15 @@ from private_gpt.server.utils.artifact_input import (
     IngestedArtifact,
     SqlDatabaseArtifact,
 )
+from private_gpt.settings.settings import settings as _load_settings
 
 
 def _tool(name: str) -> ToolSpec:
     return ToolSpec(name=name, type=f"{name}_v1")
+
+
+def _settings():
+    return _load_settings().model_copy(deep=True)
 
 
 def _resolved(name: str) -> ToolSpec:
@@ -87,8 +92,7 @@ def _request(
     tool: ToolSpec,
     *,
     tool_context: list[object] | None = None,
-    content_bundles: list[ContentBundle] | None = None,
-    bundles_to_remove: list[str] | None = None,
+    mounts: list[Mount] | None = None,
 ) -> ResolvedChatRequest:
     return ResolvedChatRequest(
         messages=[ChatMessage(role=MessageRole.USER, content="hello")],
@@ -105,8 +109,7 @@ def _request(
         context=ResolvedContextConfig(
             correlation_id="contract-correlation",
             maximum_context_length=98_765,
-            content_bundles=content_bundles or [],
-            bundles_to_remove=bundles_to_remove or [],
+            mounts=mounts or [],
         ),
     )
 
@@ -187,7 +190,7 @@ def _request(
         ),
         (
             PresentFilesToolBuilder.build_tool,
-            {"session_id", "bundles", "name", "type", "description"},
+            {"config", "name", "type", "description"},
         ),
         (
             PresentServerToolBuilder.build_tool,
@@ -308,20 +311,18 @@ async def test_web_fetch_builder_receives_complete_request_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_builder_receives_complete_session_contract() -> None:
-    bundle = ContentBundle(canonical_path="/mnt/skills/contract/")
+    mount = Mount(target="/mnt/skills/contract/", access="ro")
     builder = SimpleNamespace(build_tool=AsyncMock(return_value=_resolved("bash")))
     request = _request(
         _tool("bash"),
-        content_bundles=[bundle],
-        bundles_to_remove=["/mnt/skills/old/"],
+        mounts=[mount],
     )
 
-    assert await BashProcessor(builder).intercept(request)
+    assert await BashProcessor(builder, _settings()).intercept(request)
 
     config = builder.build_tool.await_args.args[0]
     assert config.session_id == "contract-correlation"
-    assert config.extra_bundles == [bundle]
-    assert config.bundles_to_remove == ["/mnt/skills/old/"]
+    assert config.mounts == [mount]
     builder.build_tool.assert_awaited_once_with(
         config,
         name="bash",
@@ -343,7 +344,7 @@ async def test_text_editor_builders_receive_complete_session_contract(
     tool_name: str,
     builder_method: str,
 ) -> None:
-    bundle = ContentBundle(canonical_path="/mnt/skills/editor/")
+    mount = Mount(target="/mnt/skills/editor/", access="ro")
     builder = SimpleNamespace(
         build_view_tool=AsyncMock(return_value=_resolved("view")),
         build_str_replace_tool=AsyncMock(return_value=_resolved("str_replace")),
@@ -352,8 +353,7 @@ async def test_text_editor_builders_receive_complete_session_contract(
     )
     request = _request(
         _tool(tool_name),
-        content_bundles=[bundle],
-        bundles_to_remove=["/mnt/skills/removed/"],
+        mounts=[mount],
     )
 
     assert await TextEditorProcessor(
@@ -363,8 +363,7 @@ async def test_text_editor_builders_receive_complete_session_contract(
     method = getattr(builder, builder_method)
     config = method.await_args.args[0]
     assert config.session_id == "contract-correlation"
-    assert config.extra_bundles == [bundle]
-    assert config.bundles_to_remove == ["/mnt/skills/removed/"]
+    assert config.mounts == [mount]
     method.assert_awaited_once_with(
         config,
         name=tool_name,
@@ -374,23 +373,25 @@ async def test_text_editor_builders_receive_complete_session_contract(
 
 @pytest.mark.asyncio
 async def test_present_files_builder_receives_complete_request_contract() -> None:
-    bundle = ContentBundle(canonical_path="/mnt/skills/present/")
+    mount = Mount(target="/mnt/skills/present/", access="ro")
     builder = SimpleNamespace(
         build_tool=AsyncMock(return_value=_resolved("present_files"))
     )
     settings = SimpleNamespace(
         code_execution=SimpleNamespace(
-            tools=SimpleNamespace(present_files_enabled=True)
+            tools=SimpleNamespace(present_files=SimpleNamespace(enabled=True))
         )
     )
 
     assert await PresentFilesProcessor(builder, settings).intercept(
-        _request(_tool("present_files"), content_bundles=[bundle])
+        _request(_tool("present_files"), mounts=[mount])
     )
 
+    config = builder.build_tool.await_args.args[0]
+    assert config.session_id == "contract-correlation"
+    assert config.mounts == [mount]
     builder.build_tool.assert_awaited_once_with(
-        "contract-correlation",
-        bundles=[bundle],
+        config,
         name="present_files",
         type="present_files_v1",
     )
@@ -403,7 +404,7 @@ async def test_present_server_builder_receives_complete_request_contract() -> No
     )
     settings = SimpleNamespace(
         code_execution=SimpleNamespace(
-            tools=SimpleNamespace(present_server_enabled=True)
+            tools=SimpleNamespace(present_server=SimpleNamespace(enabled=True))
         )
     )
 

@@ -24,7 +24,7 @@ from private_gpt.chat.input_models import BlobVisibilityMode, PromptConfig
 from private_gpt.chat.schema_models import create_model_from_json_schema
 from private_gpt.components.engines.citations.types import Citation, Document
 from private_gpt.components.llm.llm_helper import AsyncTokenizerFn, TokenizerFn
-from private_gpt.components.sandbox.content_bundle import ContentBundle
+from private_gpt.components.sandbox.mount import Mount
 from private_gpt.components.tools.events.adapters import ToolEventAdapter
 from private_gpt.components.tools.tool_names import resolve_internal_tool_name
 from private_gpt.components.tools.types import ToolValidationMode
@@ -628,6 +628,15 @@ class ResolvedSystemConfig(SystemConfig):
         default=None,
         description="The system prompt to use for the chat.",
     )
+    original_prompt: str | list[TextBlock] | None = Field(
+        default=None,
+        description=(
+            "The original user-provided system prompt, before platform "
+            "layers are rendered into ``prompt``. Tool-specific consumers "
+            "such as the database query tool can use this when they need "
+            "the user's instructions rather than the final rendered prompt."
+        ),
+    )
 
     def get_prompt(self) -> list[TextBlock] | None:
         prompt_block = (
@@ -635,6 +644,11 @@ class ResolvedSystemConfig(SystemConfig):
             if isinstance(self.prompt, str)
             else self.prompt
         )
+        return prompt_block or None
+
+    def get_original_prompt(self) -> list[TextBlock] | None:
+        source = self.original_prompt or self.prompt
+        prompt_block = [TextBlock(text=source)] if isinstance(source, str) else source
         return prompt_block or None
 
 
@@ -656,18 +670,15 @@ class ResolvedContextConfig(ContextConfig):
         default=None,
         description="List of documents to use as context in the chat.",
     )
-    content_bundles: list[ContentBundle] = Field(
+    mounts: list[Mount] = Field(
         default_factory=list,
         description=(
-            "Content bundles transferred from ContentBundlesLayer. "
-            "Consumed by tool builders (e.g. BashToolBuilder) to mount skills."
+            "The single mount set for the session: skill/bundle mounts (with a "
+            "storage ref) transferred from the context stack plus Backend "
+            "mount-plan volumes resolved via MountResolver. "
+            "A change in this set recreates the sandbox instead of "
+            "materializing files into the running container."
         ),
-        exclude=True,
-    )
-    bundles_to_remove: list[str] = Field(
-        default_factory=list,
-        description="Canonical paths of skill bundles to remove from the sandbox.",
-        exclude=True,
     )
 
 
